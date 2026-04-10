@@ -10,6 +10,7 @@ wCam, hCam = 640, 480
 frameR = 40
 smoothening = 3
 
+pinchThreshold = 35
 wasPinching = False
 mode = "cursor"
 modes = ["cursor", "volume", "keyboard"]
@@ -165,8 +166,9 @@ while True:
 
             plocX, plocY = clocX, clocY
 
-            # Click gesture: all 5 fingers up (single click per gesture hold).
-            if fingers == [1, 1, 1, 1, 1]:
+            # Click gesture: thumb + index pinch (faster than 5-finger gesture).
+            pinchLen = math.hypot(tx - ix, ty - iy)
+            if pinchLen < pinchThreshold and fingers[1] == 1:
                 if not wasPinching:
                     pyautogui.click()
                     wasPinching = True
@@ -210,9 +212,10 @@ while True:
             active_key = key_at_position(ix, iy)
             draw_keyboard(img, active_key)
             cv2.circle(img, (ix, iy), 8, (255, 0, 255), cv2.FILLED)
+            pinchLen = math.hypot(tx - ix, ty - iy)
 
-            # Keyboard press gesture: all 5 fingers up.
-            if active_key and fingers == [1, 1, 1, 1, 1] and (now - lastKeyPressTime > keyPressCooldown):
+            # Keyboard press gesture: thumb + index pinch.
+            if active_key and pinchLen < pinchThreshold and fingers[1] == 1 and (now - lastKeyPressTime > keyPressCooldown):
                 if active_key == "SPACE":
                     pyautogui.press("space")
                 elif active_key == "BACK":
@@ -230,9 +233,9 @@ while True:
                     if shiftOn:
                         shiftOn = False
                 lastKeyPressTime = now
-            # If no key is highlighted, same gesture acts as normal mouse click
+            # If no key is highlighted, pinch acts as normal mouse click
             # to place cursor focus in search bars / text boxes.
-            elif (not active_key) and fingers == [1, 1, 1, 1, 1] and (now - lastKeyPressTime > keyPressCooldown):
+            elif (not active_key) and pinchLen < pinchThreshold and fingers[1] == 1 and (now - lastKeyPressTime > keyPressCooldown):
                 pyautogui.click()
                 lastKeyPressTime = now
 
