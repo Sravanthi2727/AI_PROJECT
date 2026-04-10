@@ -1,6 +1,6 @@
 # Hand Gesture Virtual Mouse & Volume Control
 
-Control your mouse cursor and system volume using hand gestures via your webcam — no physical input needed.
+Control your mouse cursor, system volume, and type using a virtual keyboard — all through hand gestures via your webcam, no physical input needed.
 
 ---
 
@@ -24,7 +24,7 @@ pip install opencv-python mediapipe pyautogui pycaw comtypes numpy
 |---|---|
 | `opencv-python` | Webcam capture and image rendering |
 | `mediapipe` | Hand landmark detection |
-| `pyautogui` | Mouse movement and click control |
+| `pyautogui` | Mouse movement, click, and keyboard input |
 | `pycaw` | Windows system volume control |
 | `comtypes` | Required by pycaw |
 | `numpy` | Numerical interpolation |
@@ -43,7 +43,30 @@ Press `q` or make a **fist and hold** to exit.
 
 ---
 
+## Modes
+
+The app cycles through 3 modes. Switch between them using the **index + middle finger hold** gesture or press `m` on your keyboard.
+
+```
+Cursor Mode  →  Volume Mode  →  Keyboard Mode  →  (back to Cursor)
+```
+
+The current mode is always shown on screen.
+
+---
+
 ## Gesture Guide
+
+### Universal Gestures (work in all modes)
+
+| Gesture | Action |
+|---|---|
+| Index + Middle fingers up — hold 0.5s | Cycle to next mode |
+| Fist (all fingers closed) — hold 0.8s | Exit the program |
+| `m` key on keyboard | Cycle to next mode |
+| `q` key on keyboard | Exit the program |
+
+---
 
 ### Cursor Mode (default)
 
@@ -51,18 +74,44 @@ Press `q` or make a **fist and hold** to exit.
 |---|---|
 | Index finger up | Move mouse cursor |
 | All 5 fingers open (full hand) | Left click |
-| Index + Middle fingers up — hold 0.5s | Switch to Volume Mode |
-| Fist (all fingers closed) — hold 0.8s | Exit the program |
+
+---
 
 ### Volume Mode
 
 | Gesture | Action |
 |---|---|
-| Pinch thumb & index finger | Control system volume (closer = lower, wider = louder) |
-| Index + Middle fingers up — hold 0.5s | Switch back to Cursor Mode |
-| Fist (all fingers closed) — hold 0.8s | Exit the program |
+| Vary distance between thumb & index finger | Control system volume (pinch = lower, spread = louder) |
 
-> The current mode is displayed on screen. You can also press `m` on your keyboard to toggle modes.
+A volume bar is shown on screen with the current percentage.
+
+---
+
+### Keyboard Mode
+
+A full virtual keyboard is rendered on the webcam feed. Point your index finger to hover over keys — the hovered key highlights green.
+
+| Gesture | Action |
+|---|---|
+| Index finger hover | Highlight a key |
+| All 5 fingers open (full hand) | Press the highlighted key |
+| Hover + open hand on `SHIFT` | Toggle Shift on/off (one-shot — auto-disables after one letter) |
+| Hover + open hand on `SPACE` | Type a space |
+| Hover + open hand on `BACK` | Backspace |
+| Hover + open hand on `ENTER` | Enter / newline |
+| Open hand with no key highlighted | Mouse click (to focus a text box) |
+
+#### Keyboard Layout
+
+```
+1  2  3  4  5  6  7  8  9  0
+Q  W  E  R  T  Y  U  I  O  P
+A  S  D  F  G  H  J  K  L
+SHIFT  Z  X  C  V  B  N  M  BACK
+      SPACE          ENTER
+```
+
+> In Keyboard Mode the OS cursor still moves with your index finger, so you can click into any text field before typing.
 
 ---
 
@@ -70,4 +119,4 @@ Press `q` or make a **fist and hold** to exit.
 
 - Make sure your hand is clearly visible and well-lit for best tracking accuracy.
 - The app uses your default webcam (index 0).
-- `pyautogui.FAILSAFE` is disabled — move your mouse to a screen corner won't abort the script.
+- `pyautogui.FAILSAFE` is disabled — moving your mouse to a screen corner won't abort the script.
