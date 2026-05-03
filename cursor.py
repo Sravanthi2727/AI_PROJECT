@@ -49,12 +49,43 @@ KEY_START_X, KEY_START_Y = 15, 240
 
 # Drawing mode setup.
 canvas = np.zeros((hCam, wCam, 3), dtype=np.uint8)
-drawColor = (0, 255, 255)
-brushThickness = 6
+# penColor: last palette pick; drawing uses mirrored coords (drawX) to match on-screen hand.
+penColor = (0, 255, 255)
 drawPrevX, drawPrevY = None, None
 clearLatch = False
 cursorLocked = False
 cursorToggleLatch = False
+drawEraserMode = False
+eraserToggleLatch = False
+palettePinchLatch = False
+# Basic BGR swatches (red, green, blue, yellow); pinch thumb+index on a swatch to select.
+DRAW_PALETTE_COLORS = [
+    (0, 0, 255),
+    (0, 255, 0),
+    (255, 0, 0),
+    (0, 255, 255),
+]
+DRAW_PALETTE_SW = 56
+DRAW_PALETTE_SH = 30
+DRAW_PALETTE_GAP = 6
+DRAW_PALETTE_TOP = 34
+DRAW_PALETTE_PREVIEW_W = 36
+DRAW_PALETTE_PREVIEW_GAP = 14
+# Looser than keyboard typing so color pick registers more reliably.
+DRAW_PALETTE_PINCH_THRESH = 48
+# Brief flash on preview after a successful pick.
+palette_pick_flash_until = 0.0
+# Set each frame in drawing mode for palette UI (hover / hints).
+draw_palette_hover_idx = None
+draw_palette_wants_pinch = False
+# Last brush size label for drawing UI (kept when hand briefly lost).
+drawBrushThicknessDisplay = 6
+# Fingertip cursor drawn after canvas blend so it stays fully visible (not dimmed by addWeighted).
+draw_overlay_tip_show = False
+draw_overlay_tip_x = 0
+draw_overlay_tip_y = 0
+draw_overlay_tip_fill = (0, 255, 255)
+draw_overlay_tip_hover = False
 
 cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
 cap.set(3, wCam)
@@ -180,14 +211,119 @@ def key_at_position(x_pos, y_pos):
             x += w + KEY_GAP
     return None
 
+
+def _drawing_palette_layout():
+    """Return (start_x, top, sw_w, sh, gap, colors, preview_x)."""
+    colors = DRAW_PALETTE_COLORS
+    n = len(colors)
+    sw, sh, gap = DRAW_PALETTE_SW, DRAW_PALETTE_SH, DRAW_PALETTE_GAP
+    total_w = n * sw + (n - 1) * gap
+    start_x = (wCam - total_w) // 2
+    top = DRAW_PALETTE_TOP
+    preview_x = start_x + total_w + DRAW_PALETTE_PREVIEW_GAP
+    return start_x, top, sw, sh, gap, colors, preview_x
+
+
+def _drawing_palette_sw_index(px, py):
+    """Return swatch index if (px, py) lies inside the palette bar; px must be mirrored X (same as drawX)."""
+    start_x, top, sw, sh, gap, colors, _ = _drawing_palette_layout()
+    if py < top or py > top + sh:
+        return None
+    for i in range(len(colors)):
+        sx = start_x + i * (sw + gap)
+        if sx <= px <= sx + sw:
+            return i
+    return None
+
+
+def _render_drawing_ui(img, thickness_display, now_t):
+    """Palette, current-color preview, thickness — call after canvas blend so UI stays crisp."""
+    start_x, top, sw, sh, gap, colors, preview_x = _drawing_palette_layout()
+    bar_pad = 8
+    bar_x0 = max(4, start_x - bar_pad)
+    bar_y0 = 8
+    bar_x1 = min(wCam - 4, preview_x + DRAW_PALETTE_PREVIEW_W + bar_pad)
+    bar_y1 = top + sh + bar_pad + 52
+    cv2.rectangle(img, (bar_x0, bar_y0), (bar_x1, bar_y1), (25, 25, 35), cv2.FILLED)
+    cv2.rectangle(img, (bar_x0, bar_y0), (bar_x1, bar_y1), (90, 90, 110), 1)
+
+    cv2.putText(img, "COLORS: touch a square with index tip, then pinch thumb+index to select", (bar_x0 + 4, bar_y0 + 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 245, 255), 1)
+
+    for i, c in enumerate(colors):
+        sx = start_x + i * (sw + gap)
+        cv2.rectangle(img, (sx, top), (sx + sw, top + sh), c, cv2.FILLED)
+        border = (220, 220, 220)
+        thick = 1
+        if draw_palette_hover_idx == i:
+            border = (80, 255, 120) if not draw_palette_wants_pinch else (0, 255, 255)
+            thick = 2
+        cv2.rectangle(img, (sx, top), (sx + sw, top + sh), border, thick)
+
+    if drawEraserMode:
+        preview_c = (55, 55, 62)
+        cv2.rectangle(img, (preview_x, top), (preview_x + DRAW_PALETTE_PREVIEW_W, top + sh),
+                      preview_c, cv2.FILLED)
+        cv2.line(img, (preview_x + 4, top + 4), (preview_x + DRAW_PALETTE_PREVIEW_W - 4, top + sh - 4),
+                 (200, 200, 210), 2)
+        cv2.line(img, (preview_x + DRAW_PALETTE_PREVIEW_W - 4, top + 4), (preview_x + 4, top + sh - 4),
+                 (200, 200, 210), 2)
+    else:
+        preview_c = penColor
+        cv2.rectangle(img, (preview_x, top), (preview_x + DRAW_PALETTE_PREVIEW_W, top + sh),
+                      preview_c, cv2.FILLED)
+    pv_flash = now_t < palette_pick_flash_until
+    preview_border = (0, 255, 128) if pv_flash else (255, 255, 255)
+    cv2.rectangle(img, (preview_x, top), (preview_x + DRAW_PALETTE_PREVIEW_W, top + sh),
+                  preview_border, 2 if pv_flash else 1)
+
+    cv2.putText(img, "current", (preview_x, top + sh + 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 210), 1)
+
+    hint_y = top + sh + 36
+    if draw_palette_hover_idx is not None and draw_palette_wants_pinch:
+        cv2.putText(img, ">>> PINCH now (bring thumb to index) <<<", (start_x, hint_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 2)
+    elif draw_palette_hover_idx is not None:
+        cv2.putText(img, "On color — pinch thumb + index to select", (start_x, hint_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (180, 255, 200), 1)
+
+    cv2.putText(img, f"Brush: {thickness_display}px", (start_x, hint_y + 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    if drawEraserMode:
+        cv2.putText(img, "ERASER", (preview_x + DRAW_PALETTE_PREVIEW_W + 10, top + sh - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (180, 230, 255), 2)
+
+
+def _draw_drawing_fingertip_overlay(img):
+    """High-contrast fingertip marker on top of blended feed (not multiplied by addWeighted)."""
+    if not draw_overlay_tip_show:
+        return
+    x, y = int(draw_overlay_tip_x), int(draw_overlay_tip_y)
+    fill = draw_overlay_tip_fill
+    # Outer white ring, thin black ring, filled core — stays readable on any background.
+    cv2.circle(img, (x, y), 16, (255, 255, 255), 2)
+    cv2.circle(img, (x, y), 14, (0, 0, 0), 2)
+    cv2.circle(img, (x, y), 11, fill, cv2.FILLED)
+    cv2.circle(img, (x, y), 11, (255, 255, 255), 1)
+    if draw_overlay_tip_hover:
+        cv2.circle(img, (x, y), 24, (0, 255, 100), 2)
+
+
 while True:
     success, img = cap.read()
     if not success:
         continue
 
+    draw_overlay_tip_show = False
+
     # Disable heavy landmark drawing in hot path for lower latency.
     img = detector.findHands(img, draw=False)
     lmList = detector.findPosition(img, draw=False)
+
+    if len(lmList) == 0 and mode == "drawing":
+        draw_palette_hover_idx = None
+        draw_palette_wants_pinch = False
 
     if len(lmList) != 0:
         ix, iy = lmList[8][1], lmList[8][2]  # Index tip
@@ -415,21 +551,73 @@ while True:
                     pyautogui.click()
                 lastKeyPressTime = now
         else:
-            # Drawing mode: index up draws, index+middle up moves without drawing.
+            # Drawing mode: mirror X so ink tracks the fingertip as shown (same intuition as cursor wScr flip).
             lastScrollY = None
             scrollAccumulator = 0.0
             x1 = min(max(ix, frameR), wCam - frameR)
             y1 = min(max(iy, frameR), hCam - frameR)
+            drawX = wCam - x1
+            # Fingertip dot aligns with palette using mirrored X (drawX) and raw Y in the top band.
+            pointer_y = iy if iy <= frameR else y1
+
+            # Thumb–index distance sets brush size (pen 2–20px, eraser 15–35px).
+            t_pen = int(np.clip(np.interp(thumb_index_dist, [30, 150], [2, 20]), 2, 20))
+            t_eraser = int(np.clip(np.interp(thumb_index_dist, [30, 150], [15, 35]), 15, 35))
+            drawBrushThicknessDisplay = t_eraser if drawEraserMode else t_pen
+
+            # Eraser toggle: middle finger only up [thumb, index, middle, ring, pinky].
+            eraser_gesture = fingers == [0, 0, 1, 0, 0]
+            if eraser_gesture:
+                if not eraserToggleLatch:
+                    drawEraserMode = not drawEraserMode
+                    eraserToggleLatch = True
+            else:
+                eraserToggleLatch = False
+
+            # Palette hit uses same mirrored X as drawing so the dot sits on the swatch you mean.
+            hover_idx = _drawing_palette_sw_index(drawX, iy)
+            draw_palette_hover_idx = hover_idx
+            draw_palette_wants_pinch = (
+                hover_idx is not None and thumb_index_dist > DRAW_PALETTE_PINCH_THRESH
+            )
+
+            # Palette: looser pinch threshold than keyboard; index must be up.
+            palette_pinch = (
+                thumb_index_dist < DRAW_PALETTE_PINCH_THRESH
+                and fingers[1] == 1
+                and fingers != [1, 1, 1, 1, 1]
+            )
+            if palette_pinch:
+                if hover_idx is not None and not palettePinchLatch:
+                    penColor = DRAW_PALETTE_COLORS[hover_idx]
+                    drawEraserMode = False
+                    palettePinchLatch = True
+                    palette_pick_flash_until = now + 0.35
+            else:
+                palettePinchLatch = False
 
             # Draw state gestures.
             drawGesture = (fingers[1] == 1 and fingers[2] == 0)
             hoverGesture = (fingers[1] == 1 and fingers[2] == 1)
 
+            # Eraser removes ink by painting canvas black (0,0,0); blend layer uses zero ink there — not white paint.
+            CANVAS_CLEAR = (0, 0, 0)
+            stroke_color = CANVAS_CLEAR if drawEraserMode else penColor
+            stroke_thick = t_eraser if drawEraserMode else t_pen
+            stroke_y = pointer_y
+
             if drawGesture:
                 if drawPrevX is None:
-                    drawPrevX, drawPrevY = x1, y1
-                cv2.line(canvas, (drawPrevX, drawPrevY), (x1, y1), drawColor, brushThickness)
-                drawPrevX, drawPrevY = x1, y1
+                    drawPrevX, drawPrevY = drawX, stroke_y
+                cv2.line(
+                    canvas,
+                    (drawPrevX, drawPrevY),
+                    (drawX, stroke_y),
+                    stroke_color,
+                    stroke_thick,
+                    cv2.LINE_8,
+                )
+                drawPrevX, drawPrevY = drawX, stroke_y
             else:
                 drawPrevX, drawPrevY = None, None
 
@@ -441,14 +629,23 @@ while True:
             else:
                 clearLatch = False
 
-            cursorColor = (0, 255, 255) if drawGesture else (255, 0, 255)
-            cv2.circle(img, (x1, y1), 8, cursorColor, cv2.FILLED)
-            if hoverGesture:
-                cv2.circle(img, (x1, y1), 16, (0, 255, 0), 1)
+            # Fingertip marker drawn after addWeighted so it is not dimmed.
+            draw_overlay_tip_show = True
+            draw_overlay_tip_x = drawX
+            draw_overlay_tip_y = pointer_y
+            if drawEraserMode:
+                draw_overlay_tip_fill = (0, 140, 255) if drawGesture else (120, 180, 255)
+            elif drawGesture:
+                draw_overlay_tip_fill = (0, 255, 255)
+            else:
+                draw_overlay_tip_fill = (255, 80, 255)
+            draw_overlay_tip_hover = hoverGesture
 
     # Blend drawing canvas on top of camera frame.
     if mode == "drawing":
         img = cv2.addWeighted(img, 0.7, canvas, 1.0, 0.0)
+        _render_drawing_ui(img, drawBrushThicknessDisplay, time.time())
+        _draw_drawing_fingertip_overlay(img)
 
     cTime = time.time()
     fps = 1/(cTime - pTime) if (cTime - pTime) != 0 else 0
@@ -480,8 +677,8 @@ while True:
         cv2.putText(img, "Keyboard: pinch on key to type", (20, 145),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 255, 180), 1)
     elif mode == "drawing":
-        cv2.putText(img, "Draw: index up | Hover: index+middle | Clear: 5 fingers", (20, 145),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 255, 180), 1)
+        cv2.putText(img, "Draw: index | Hover: index+mid | Clear: 5 | Palette: pinch swatch | Eraser: mid only", (20, 145),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (180, 255, 180), 1)
     cv2.putText(img, f'FPS: {int(fps)}', (20, 50),
                 cv2.FONT_HERSHEY_COMPLEX, 1, (255, 0, 255), 2)
 
