@@ -649,18 +649,9 @@ while True:
             cv2.circle(img, (ix, iy), 8, (255, 0, 255), cv2.FILLED)
             cv2.line(img, (tx, ty), (ix, iy), (255, 0, 255), 2)
         elif mode == "keyboard":
-            # Keyboard mode: move cursor with index and pinch to type (main window only).
+            # Keyboard mode: no OS cursor motion — raw index tip (ix, iy) drives overlay only.
             lastScrollY = None
             scrollAccumulator = 0.0
-            x1 = min(max(ix, frameR), wCam - frameR)
-            y1 = min(max(iy, frameR), hCam - frameR)
-            x3 = (x1 - frameR) * wScr / (wCam - 2 * frameR)
-            y3 = (y1 - frameR) * hScr / (hCam - 2 * frameR)
-            clocX = plocX + (x3 - plocX) / smoothening
-            clocY = plocY + (y3 - plocY) / smoothening
-            if abs(clocX - plocX) > moveDeadZone or abs(clocY - plocY) > moveDeadZone:
-                pyautogui.moveTo(wScr - clocX, clocY)
-            plocX, plocY = clocX, clocY
 
             active_key = simple_kb.draw(img, ix, iy, now)
             cv2.circle(img, (ix, iy), 8, (255, 0, 255), cv2.FILLED)
