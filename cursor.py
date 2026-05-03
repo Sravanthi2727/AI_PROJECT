@@ -1,6 +1,8 @@
 import cv2
 import sys
 import time
+from typing import Optional
+
 import numpy as np
 import handtrackingModule as htm
 import pyautogui
@@ -33,19 +35,7 @@ lastScrollY = None
 lastScrollTime = 0.0
 scrollAccumulator = 0.0
 keyboardPinchThreshold = 32
-keyPressCooldown = 0.25
-lastKeyPressTime = 0.0
-
-KEY_ROWS = [
-    list("1234567890"),
-    list("QWERTYUIOP"),
-    list("ASDFGHJKL"),
-    ["Z", "X", "C", "V", "B", "N", "M", "BACK"],
-    ["SPACE", "ENTER"],
-]
-KEY_W, KEY_H = 50, 45
-KEY_GAP = 6
-KEY_START_X, KEY_START_Y = 15, 240
+keyboard_pinch_prev = False
 
 # Drawing mode setup.
 canvas = np.zeros((hCam, wCam, 3), dtype=np.uint8)
@@ -173,43 +163,181 @@ if sbc is not None:
         brightnessValue = got
 
 
-def draw_keyboard(img, active_key=None):
-    for row_idx, row in enumerate(KEY_ROWS):
-        y = KEY_START_Y + row_idx * (KEY_H + KEY_GAP)
-        row_width = len(row) * KEY_W + (len(row) - 1) * KEY_GAP
-        x = (wCam - row_width) // 2
-        for key in row:
-            w = KEY_W
-            if key == "SPACE":
-                w = KEY_W * 4
-            elif key in ("BACK", "ENTER"):
-                w = KEY_W * 2
-            color = (60, 60, 60) if key != active_key else (0, 200, 0)
-            cv2.rectangle(img, (x, y), (x + w, y + KEY_H), color, cv2.FILLED)
-            cv2.rectangle(img, (x, y), (x + w, y + KEY_H), (255, 255, 255), 1)
-            font_scale = 0.55 if key in ("SPACE", "BACK", "ENTER") else 0.65
-            text_w = cv2.getTextSize(key, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0][0]
-            text_x = x + (w - text_w) // 2
-            cv2.putText(img, key, (text_x, y + 29),
-                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
-            x += w + KEY_GAP
+class SimpleKeyboard:
+    """Draws QWERTY + SPACE/BACK/ENTER on the main camera frame only (no extra window)."""
+
+    def __init__(self, frame_width: int, frame_height: int):
+        self.frame_w = frame_width
+        self.frame_h = frame_height
+        self.keys = [
+            ["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"],
+            ["A", "S", "D", "F", "G", "H", "J", "K", "L", ";"],
+            ["Z", "X", "C", "V", "B", "N", "M", ",", ".", "/"],
+            ["SPACE", "BACKSPACE", "ENTER"],
+        ]
+        self.key_rects = []
+        self.last_press_time = 0.0
+        self.press_cooldown = 0.2
+        self._typed_preview = ""
+        self._press_key = None
+        self._press_until = 0.0
+        self.KEY_W = 45
+        self.KEY_H = 40
+        self.KEY_GAP = 5
+        # Fits 4 rows in lower part of 480p frame (tutorial-style bottom band).
+        self.KEY_START_Y = 305
+        self._bg_alpha = 0.42
+        self._face_default = np.array([210, 210, 210], dtype=np.float32)
+        self._face_hover = np.array([180, 230, 255], dtype=np.float32)
+        self._face_press = np.array([100, 220, 255], dtype=np.float32)
+        self._border = (255, 255, 255)
+        self._text_color = (0, 0, 0)
+        self._build_rects()
+
+    def _row_width_letters(self, n_keys: int) -> int:
+        return n_keys * self.KEY_W + (n_keys - 1) * self.KEY_GAP
+
+    def _build_rects(self):
+        self.key_rects = []
+        y = self.KEY_START_Y
+        for ri, row in enumerate(self.keys):
+            if ri < 3:
+                rw = self._row_width_letters(len(row))
+                x = (self.frame_w - rw) // 2
+                for k in row:
+                    self.key_rects.append((k, x, y, self.KEY_W, self.KEY_H))
+                    x += self.KEY_W + self.KEY_GAP
+            else:
+                w_space = 5 * self.KEY_W + 4 * self.KEY_GAP
+                w_bs = 2 * self.KEY_W + self.KEY_GAP
+                w_ent = 2 * self.KEY_W + self.KEY_GAP
+                rw = w_space + w_bs + w_ent + 2 * self.KEY_GAP
+                x = (self.frame_w - rw) // 2
+                for k, kw in [("SPACE", w_space), ("BACKSPACE", w_bs), ("ENTER", w_ent)]:
+                    self.key_rects.append((k, x, y, kw, self.KEY_H))
+                    x += kw + self.KEY_GAP
+            y += self.KEY_H + self.KEY_GAP
+
+    def _label_for_draw(self, key: str) -> str:
+        if key == "BACKSPACE":
+            return "\u232b"
+        if key == "ENTER":
+            return "\u21b5"
+        if key == "SPACE":
+            return "Space"
+        return key
+
+    def key_at(self, x_pos: float, y_pos: float) -> Optional[str]:
+        for item in self.key_rects:
+            k, x, y, w, h = item
+            if x <= x_pos <= x + w and y <= y_pos <= y + h:
+                return k
+        return None
+
+    def _keyboard_roi_bounds(self):
+        if not self.key_rects:
+            return None
+        min_y = min(r[2] for r in self.key_rects)
+        max_y = max(r[2] + r[4] for r in self.key_rects)
+        min_x = min(r[1] for r in self.key_rects)
+        max_x = max(r[1] + r[3] for r in self.key_rects)
+        pad = 6
+        return (
+            max(0, min_x - pad),
+            max(0, min_y - pad),
+            min(self.frame_w, max_x + pad),
+            min(self.frame_h, max_y + pad),
+        )
+
+    def draw(self, img: np.ndarray, finger_x: float, finger_y: float, now: float) -> Optional[str]:
+        hovered = self.key_at(finger_x, finger_y)
+
+        bounds = self._keyboard_roi_bounds()
+        if bounds:
+            x0, y0, x1, y1 = bounds
+            roi = img[y0:y1, x0:x1].astype(np.float32)
+            overlay = np.full_like(roi, (40.0, 42.0, 48.0))
+            blended = roi * (1.0 - self._bg_alpha) + overlay * self._bg_alpha
+            img[y0:y1, x0:x1] = blended.astype(np.uint8)
+
+        for item in self.key_rects:
+            k, x, y, w, h = item
+            face = self._face_default.copy()
+            if k == hovered:
+                face = self._face_hover.copy()
+            if self._press_key == k and now < self._press_until:
+                face = self._face_press.copy()
+            cv2.rectangle(
+                img,
+                (x, y),
+                (x + w, y + h),
+                tuple(int(c) for c in face),
+                cv2.FILLED,
+            )
+            cv2.rectangle(img, (x, y), (x + w, y + h), self._border, 1)
+            label = self._label_for_draw(k)
+            fs = 0.48 if k in ("SPACE", "BACKSPACE", "ENTER") else 0.55
+            tw = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, fs, 1)[0][0]
+            tx = x + max(0, (w - tw) // 2)
+            ty = y + int(h * 0.65)
+            cv2.putText(
+                img,
+                label,
+                (tx, ty),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                fs,
+                self._text_color,
+                1,
+                cv2.LINE_AA,
+            )
+
+        preview_y = self.KEY_START_Y - 10
+        if self._typed_preview:
+            preview = self._typed_preview[-10:]
+            pad_x = 8
+            tw = cv2.getTextSize(preview, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)[0][0]
+            bx1 = min(self.frame_w - 4, pad_x + tw + 16)
+            cv2.rectangle(img, (pad_x, preview_y - 26), (bx1, preview_y + 4), (235, 235, 240), cv2.FILLED)
+            cv2.rectangle(img, (pad_x, preview_y - 26), (bx1, preview_y + 4), (255, 255, 255), 1)
+            cv2.putText(
+                img,
+                preview,
+                (pad_x + 8, preview_y - 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (20, 20, 20),
+                1,
+                cv2.LINE_AA,
+            )
+        return hovered
+
+    def press_key(self, key: Optional[str], now: float) -> bool:
+        if not key:
+            return False
+        if now - self.last_press_time < self.press_cooldown:
+            return False
+        self.last_press_time = now
+        self._press_key = key
+        self._press_until = now + 0.12
+
+        if key == "SPACE":
+            pyautogui.press("space")
+            self._typed_preview += " "
+        elif key == "BACKSPACE":
+            pyautogui.press("backspace")
+            self._typed_preview = self._typed_preview[:-1]
+        elif key == "ENTER":
+            pyautogui.press("enter")
+            self._typed_preview += " "
+        else:
+            ch = key.lower() if len(key) == 1 and key.isalpha() else key
+            pyautogui.write(ch, interval=0)
+            self._typed_preview += ch if len(ch) == 1 else ""
+        self._typed_preview = self._typed_preview[-40:]
+        return True
 
 
-def key_at_position(x_pos, y_pos):
-    for row_idx, row in enumerate(KEY_ROWS):
-        y = KEY_START_Y + row_idx * (KEY_H + KEY_GAP)
-        row_width = len(row) * KEY_W + (len(row) - 1) * KEY_GAP
-        x = (wCam - row_width) // 2
-        for key in row:
-            w = KEY_W
-            if key == "SPACE":
-                w = KEY_W * 4
-            elif key in ("BACK", "ENTER"):
-                w = KEY_W * 2
-            if x <= x_pos <= x + w and y <= y_pos <= y + KEY_H:
-                return key
-            x += w + KEY_GAP
-    return None
+simple_kb = SimpleKeyboard(wCam, hCam)
 
 
 def _drawing_palette_layout():
@@ -324,6 +452,9 @@ while True:
     if len(lmList) == 0 and mode == "drawing":
         draw_palette_hover_idx = None
         draw_palette_wants_pinch = False
+
+    if mode != "keyboard":
+        keyboard_pinch_prev = False
 
     if len(lmList) != 0:
         ix, iy = lmList[8][1], lmList[8][2]  # Index tip
@@ -518,7 +649,7 @@ while True:
             cv2.circle(img, (ix, iy), 8, (255, 0, 255), cv2.FILLED)
             cv2.line(img, (tx, ty), (ix, iy), (255, 0, 255), 2)
         elif mode == "keyboard":
-            # Keyboard mode: move cursor with index and pinch to type.
+            # Keyboard mode: move cursor with index and pinch to type (main window only).
             lastScrollY = None
             scrollAccumulator = 0.0
             x1 = min(max(ix, frameR), wCam - frameR)
@@ -531,25 +662,14 @@ while True:
                 pyautogui.moveTo(wScr - clocX, clocY)
             plocX, plocY = clocX, clocY
 
-            active_key = key_at_position(ix, iy)
-            draw_keyboard(img, active_key)
+            active_key = simple_kb.draw(img, ix, iy, now)
             cv2.circle(img, (ix, iy), 8, (255, 0, 255), cv2.FILLED)
 
-            pinchLen = math.hypot(tx - ix, ty - iy)
-            pinchPress = pinchLen < keyboardPinchThreshold and fingers[1] == 1
-            if pinchPress and (now - lastKeyPressTime > keyPressCooldown):
-                if active_key == "SPACE":
-                    pyautogui.press("space")
-                elif active_key == "BACK":
-                    pyautogui.press("backspace")
-                elif active_key == "ENTER":
-                    pyautogui.press("enter")
-                elif active_key:
-                    pyautogui.write(active_key.lower())
-                else:
-                    # Pinch outside keyboard acts as regular click (focus input box).
-                    pyautogui.click()
-                lastKeyPressTime = now
+            pinch_down = thumb_index_dist < keyboardPinchThreshold and fingers[1] == 1
+            pinch_edge = pinch_down and not keyboard_pinch_prev
+            keyboard_pinch_prev = pinch_down
+            if pinch_edge and active_key:
+                simple_kb.press_key(active_key, now)
         else:
             # Drawing mode: mirror X so ink tracks the fingertip as shown (same intuition as cursor wScr flip).
             lastScrollY = None
