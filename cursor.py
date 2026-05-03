@@ -1,4 +1,5 @@
 import cv2
+import sys
 import time
 import numpy as np
 import handtrackingModule as htm
@@ -366,6 +367,11 @@ while True:
             if sbc is None:
                 cv2.putText(img, "pip install screen-brightness-control", (180, 205),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+                pyexe = sys.executable
+                if len(pyexe) > 52:
+                    pyexe = "..." + pyexe[-49:]
+                cv2.putText(img, f"for: {pyexe}", (180, 228),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 255), 1)
             elif brightnessGiveUp:
                 cv2.putText(img, "Brightness API failed - external monitors often unsupported", (20, 200),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 255), 2)
