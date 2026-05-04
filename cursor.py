@@ -14,6 +14,11 @@ try:
 except ImportError:
     sbc = None
 
+try:
+    import winsound
+except ImportError:
+    winsound = None
+
 wCam, hCam = 640, 480
 frameR = 40
 smoothening = 2.5
@@ -173,11 +178,11 @@ class SimpleKeyboard:
             ["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"],
             ["A", "S", "D", "F", "G", "H", "J", "K", "L", ";"],
             ["Z", "X", "C", "V", "B", "N", "M", ",", ".", "/"],
-            ["SPACE", "BACKSPACE", "ENTER"],
+            ["SPACE", "BACKSPACE", "DELETE", "ENTER"],
         ]
         self.key_rects = []
         self.last_press_time = 0.0
-        self.press_cooldown = 0.2
+        self.press_cooldown = 0.12
         self._typed_preview = ""
         self._press_key = None
         self._press_until = 0.0
@@ -186,13 +191,44 @@ class SimpleKeyboard:
         self.KEY_GAP = 5
         # Fits 4 rows in lower part of 480p frame (tutorial-style bottom band).
         self.KEY_START_Y = 305
-        self._bg_alpha = 0.42
+        self._bg_alpha = 0.5
         self._face_default = np.array([210, 210, 210], dtype=np.float32)
         self._face_hover = np.array([180, 230, 255], dtype=np.float32)
         self._face_press = np.array([100, 220, 255], dtype=np.float32)
+        self._face_glow = np.array([120, 200, 255], dtype=np.float32)
         self._border = (255, 255, 255)
         self._text_color = (0, 0, 0)
+        # Performance optimization
+        self._last_draw_time = 0.0
+        self._keyboard_fps_limit = 30.0
+        self._min_draw_interval = 1.0 / self._keyboard_fps_limit
+        self._cached_background = None
+        self._cached_key_surfaces = {}
+        self._enable_haptic = True
+        self._last_hovered_key = None
+        self._hover_start_time = 0.0
+        # Performance metrics
+        self._keyboard_fps = 0.0
+        self._last_fps_update = 0.0
+        self._fps_frame_count = 0
+        self._performance_mode = False
+        
+        # Temporal smoothing and stability
+        self._smoothed_x = 0.0
+        self._smoothed_y = 0.0
+        self._smoothing_alpha = 0.3  # EMA smoothing factor
+        self._hover_debounce_time = 0.2  # 200ms to confirm hover
+        self._hover_candidate_key = None
+        self._hover_candidate_start = 0.0
+        self._confirmed_hovered_key = None
+        self._pinch_stable_time = 0.1  # 100ms stable pinch before click
+        self._pinch_candidate_start = 0.0
+        self._pinch_confirmed = False
+        self._key_dead_zone = 8  # Extra margin around keys
+        self._last_drawn_hovered_key = None
+        self._finger_moved_threshold = 5.0  # Minimum movement to trigger redraw
         self._build_rects()
+        self._pre_render_keys()
 
     def _row_width_letters(self, n_keys: int) -> int:
         return n_keys * self.KEY_W + (n_keys - 1) * self.KEY_GAP
@@ -210,10 +246,11 @@ class SimpleKeyboard:
             else:
                 w_space = 5 * self.KEY_W + 4 * self.KEY_GAP
                 w_bs = 2 * self.KEY_W + self.KEY_GAP
+                w_del = 2 * self.KEY_W + self.KEY_GAP
                 w_ent = 2 * self.KEY_W + self.KEY_GAP
-                rw = w_space + w_bs + w_ent + 2 * self.KEY_GAP
+                rw = w_space + w_bs + w_del + w_ent + 3 * self.KEY_GAP
                 x = (self.frame_w - rw) // 2
-                for k, kw in [("SPACE", w_space), ("BACKSPACE", w_bs), ("ENTER", w_ent)]:
+                for k, kw in [("SPACE", w_space), ("BACKSPACE", w_bs), ("DELETE", w_del), ("ENTER", w_ent)]:
                     self.key_rects.append((k, x, y, kw, self.KEY_H))
                     x += kw + self.KEY_GAP
             y += self.KEY_H + self.KEY_GAP
@@ -221,6 +258,8 @@ class SimpleKeyboard:
     def _label_for_draw(self, key: str) -> str:
         if key == "BACKSPACE":
             return "\u232b"
+        if key == "DELETE":
+            return "Del"
         if key == "ENTER":
             return "\u21b5"
         if key == "SPACE":
@@ -230,9 +269,75 @@ class SimpleKeyboard:
     def key_at(self, x_pos: float, y_pos: float) -> Optional[str]:
         for item in self.key_rects:
             k, x, y, w, h = item
-            if x <= x_pos <= x + w and y <= y_pos <= y + h:
+            # Add dead zone around keys for hysteresis
+            margin = self._key_dead_zone
+            if x - margin <= x_pos <= x + w + margin and y - margin <= y_pos <= y + h + margin:
                 return k
         return None
+
+    def _smooth_finger_position(self, raw_x: float, raw_y: float) -> tuple[float, float]:
+        """Apply exponential moving average to smooth finger position."""
+        if self._smoothed_x == 0.0 and self._smoothed_y == 0.0:
+            # Initialize on first call
+            self._smoothed_x = raw_x
+            self._smoothed_y = raw_y
+        else:
+            # Apply EMA smoothing
+            self._smoothed_x = self._smoothing_alpha * raw_x + (1 - self._smoothing_alpha) * self._smoothed_x
+            self._smoothed_y = self._smoothing_alpha * raw_y + (1 - self._smoothing_alpha) * self._smoothed_y
+        return self._smoothed_x, self._smoothed_y
+
+    def _update_stable_hover(self, candidate_key: Optional[str], now: float) -> Optional[str]:
+        """Update stable hover state with debouncing."""
+        if candidate_key != self._hover_candidate_key:
+            # New candidate, reset timer
+            self._hover_candidate_key = candidate_key
+            self._hover_candidate_start = now
+        else:
+            # Same candidate, check if debounce time passed
+            if candidate_key and now - self._hover_candidate_start >= self._hover_debounce_time:
+                # Confirm this as the hovered key
+                if candidate_key != self._confirmed_hovered_key:
+                    self._confirmed_hovered_key = candidate_key
+                    self._hover_start_time = now  # Reset for preview timing
+                return candidate_key
+            elif not candidate_key:
+                # No candidate, clear confirmed hover
+                self._confirmed_hovered_key = None
+        
+        return self._confirmed_hovered_key
+
+    def _should_trigger_pinch(self, is_pinching: bool, now: float) -> bool:
+        """Determine if pinch should trigger with stability check."""
+        if is_pinching:
+            if not self._pinch_confirmed:
+                # Start or continue pinch candidate
+                if self._pinch_candidate_start == 0.0:
+                    self._pinch_candidate_start = now
+                # Check if pinch is stable for required time
+                if now - self._pinch_candidate_start >= self._pinch_stable_time:
+                    self._pinch_confirmed = True
+                    return True
+        else:
+            # Reset pinch state
+            self._pinch_candidate_start = 0.0
+            self._pinch_confirmed = False
+        
+        return False
+
+    def _finger_moved_significantly(self, x: float, y: float) -> bool:
+        """Check if finger moved enough to warrant redraw."""
+        if not hasattr(self, '_last_finger_x'):
+            self._last_finger_x = x
+            self._last_finger_y = y
+            return True
+        
+        distance = math.hypot(x - self._last_finger_x, y - self._last_finger_y)
+        if distance >= self._finger_moved_threshold:
+            self._last_finger_x = x
+            self._last_finger_y = y
+            return True
+        return False
 
     def _keyboard_roi_bounds(self):
         if not self.key_rects:
@@ -249,9 +354,146 @@ class SimpleKeyboard:
             min(self.frame_h, max_y + pad),
         )
 
-    def draw(self, img: np.ndarray, finger_x: float, finger_y: float, now: float) -> Optional[str]:
-        hovered = self.key_at(finger_x, finger_y)
+    def _pre_render_keys(self):
+        """Pre-render key surfaces for better performance."""
+        self._cached_key_surfaces = {}
+        for key_name in ["default", "hover", "press"]:
+            color_map = {
+                "default": self._face_default,
+                "hover": self._face_hover,
+                "press": self._face_press
+            }
+            self._cached_key_surfaces[key_name] = color_map[key_name]
 
+    def _draw_key_with_effects(self, img: np.ndarray, x: int, y: int, w: int, h: int, 
+                              face_color: np.ndarray, is_hovered: bool, is_pressed: bool, now: float):
+        """Draw a single key with visual effects."""
+        # Key press animation (shrink effect)
+        if is_pressed:
+            shrink = 2
+            x += shrink
+            y += shrink
+            w -= shrink * 2
+            h -= shrink * 2
+        
+        # Draw key face with rounded corners effect
+        cv2.rectangle(img, (x, y), (x + w, y + h), 
+                     tuple(int(c) for c in face_color), cv2.FILLED, cv2.LINE_AA)
+        
+        # Draw border with glow effect on hover
+        border_color = self._border
+        border_thickness = 1
+        if is_hovered:
+            border_color = (150, 200, 255)  # Glow effect
+            border_thickness = 2
+            # Add subtle glow
+            glow_overlay = img[max(0, y-2):min(self.frame_h, y+h+2), 
+                              max(0, x-2):min(self.frame_w, x+w+2)].astype(np.float32)
+            glow_color = np.full_like(glow_overlay, (120, 200, 255))
+            alpha = 0.3
+            blended = glow_overlay * (1 - alpha) + glow_color * alpha
+            img[max(0, y-2):min(self.frame_h, y+h+2), 
+                max(0, x-2):min(self.frame_w, x+w+2)] = blended.astype(np.uint8)
+        
+        cv2.rectangle(img, (x, y), (x + w, y + h), border_color, border_thickness, cv2.LINE_AA)
+
+    def _draw_key_preview(self, img: np.ndarray, key: str, finger_x: float, finger_y: float):
+        """Draw a preview popup above the finger when hovering."""
+        if key and self._last_hovered_key == key:
+            hover_duration = time.time() - self._hover_start_time
+            if hover_duration > 0.3:  # Show preview after 300ms of hover
+                preview_size = 30
+                preview_x = int(finger_x - preview_size // 2)
+                preview_y = int(finger_y - preview_size - 20)
+                
+                # Ensure preview stays within bounds
+                preview_x = max(5, min(preview_x, self.frame_w - preview_size - 5))
+                preview_y = max(5, preview_y)
+                
+                # Draw preview background
+                cv2.rectangle(img, (preview_x, preview_y), 
+                            (preview_x + preview_size, preview_y + preview_size),
+                            (50, 50, 60), cv2.FILLED, cv2.LINE_AA)
+                cv2.rectangle(img, (preview_x, preview_y), 
+                            (preview_x + preview_size, preview_y + preview_size),
+                            (200, 200, 255), 2, cv2.LINE_AA)
+                
+                # Draw preview text
+                label = self._label_for_draw(key)
+                if len(label) > 3:
+                    label = label[:3]  # Truncate long labels
+                fs = 0.6
+                tw = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, fs, 1)[0][0]
+                tx = preview_x + (preview_size - tw) // 2
+                ty = preview_y + int(preview_size * 0.7)
+                cv2.putText(img, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 
+                          fs, (255, 255, 255), 1, cv2.LINE_AA)
+
+    def _draw_cooldown_indicator(self, img: np.ndarray, now: float):
+        """Draw a visual indicator for typing cooldown status."""
+        if now - self.last_press_time < self.press_cooldown:
+            cooldown_progress = (now - self.last_press_time) / self.press_cooldown
+            bar_width = 100
+            bar_height = 6
+            bar_x = self.frame_w - bar_width - 10
+            bar_y = 10
+            
+            # Background
+            cv2.rectangle(img, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height),
+                        (40, 40, 50), cv2.FILLED)
+            
+            # Progress
+            progress_width = int(bar_width * cooldown_progress)
+            cv2.rectangle(img, (bar_x, bar_y), (bar_x + progress_width, bar_y + bar_height),
+                        (0, 255, 100), cv2.FILLED)
+            
+            # Border
+            cv2.rectangle(img, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height),
+                        (100, 100, 120), 1)
+
+    def draw(self, img: np.ndarray, finger_x: float, finger_y: float, now: float) -> Optional[str]:
+        # Apply temporal smoothing to finger position
+        smoothed_x, smoothed_y = self._smooth_finger_position(finger_x, finger_y)
+        
+        # Check if finger moved significantly (for draw optimization)
+        finger_moved = self._finger_moved_significantly(smoothed_x, smoothed_y)
+        
+        # Update performance metrics
+        self._fps_frame_count += 1
+        if now - self._last_fps_update >= 1.0:
+            self._keyboard_fps = self._fps_frame_count / (now - self._last_fps_update)
+            self._last_fps_update = now
+            self._fps_frame_count = 0
+            
+            # Auto-adjust quality based on performance
+            if self._keyboard_fps < 25.0 and not self._performance_mode:
+                self._performance_mode = True
+                self._bg_alpha = 0.8  # Less transparency = less blending work
+                self._keyboard_fps_limit = 20.0  # Lower FPS limit
+                self._min_draw_interval = 1.0 / self._keyboard_fps_limit
+            elif self._keyboard_fps > 28.0 and self._performance_mode:
+                self._performance_mode = False
+                self._bg_alpha = 0.5  # Restore transparency
+                self._keyboard_fps_limit = 30.0  # Restore FPS limit
+                self._min_draw_interval = 1.0 / self._keyboard_fps_limit
+        
+        # FPS limiting for keyboard mode
+        if now - self._last_draw_time < self._min_draw_interval:
+            return self._confirmed_hovered_key
+        
+        self._last_draw_time = now
+        
+        # Get candidate key from smoothed position
+        candidate_key = self.key_at(smoothed_x, smoothed_y)
+        
+        # Update stable hover state with debouncing
+        hovered = self._update_stable_hover(candidate_key, now)
+        
+        # Only redraw if hover state changed or finger moved significantly
+        if hovered != self._last_drawn_hovered_key or finger_moved:
+            self._last_drawn_hovered_key = hovered
+        
+        # Draw keyboard background
         bounds = self._keyboard_roi_bounds()
         if bounds:
             x0, y0, x1, y1 = bounds
@@ -260,55 +502,62 @@ class SimpleKeyboard:
             blended = roi * (1.0 - self._bg_alpha) + overlay * self._bg_alpha
             img[y0:y1, x0:x1] = blended.astype(np.uint8)
 
+        # Draw keys with effects (skip some effects in performance mode)
         for item in self.key_rects:
             k, x, y, w, h = item
             face = self._face_default.copy()
-            if k == hovered:
+            is_hovered = (k == hovered)
+            is_pressed = (self._press_key == k and now < self._press_until)
+            
+            if is_hovered:
                 face = self._face_hover.copy()
-            if self._press_key == k and now < self._press_until:
+            if is_pressed:
                 face = self._face_press.copy()
-            cv2.rectangle(
-                img,
-                (x, y),
-                (x + w, y + h),
-                tuple(int(c) for c in face),
-                cv2.FILLED,
-            )
-            cv2.rectangle(img, (x, y), (x + w, y + h), self._border, 1)
+                
+            if self._performance_mode:
+                # Simplified drawing in performance mode
+                cv2.rectangle(img, (x, y), (x + w, y + h), 
+                             tuple(int(c) for c in face), cv2.FILLED)
+                cv2.rectangle(img, (x, y), (x + w, y + h), self._border, 1)
+            else:
+                self._draw_key_with_effects(img, x, y, w, h, face, is_hovered, is_pressed, now)
+            
+            # Draw key label
             label = self._label_for_draw(k)
-            fs = 0.48 if k in ("SPACE", "BACKSPACE", "ENTER") else 0.55
+            fs = 0.48 if k in ("SPACE", "BACKSPACE", "DELETE", "ENTER") else 0.55
             tw = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, fs, 1)[0][0]
             tx = x + max(0, (w - tw) // 2)
             ty = y + int(h * 0.65)
-            cv2.putText(
-                img,
-                label,
-                (tx, ty),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                fs,
-                self._text_color,
-                1,
-                cv2.LINE_AA,
-            )
+            cv2.putText(img, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, fs,
+                       self._text_color, 1, cv2.LINE_AA)
 
+        # Only draw extra effects in normal mode
+        if not self._performance_mode:
+            # Draw key preview popup using smoothed position
+            self._draw_key_preview(img, hovered, smoothed_x, smoothed_y)
+        
+        # Draw cooldown indicator
+        self._draw_cooldown_indicator(img, now)
+
+        # Draw typed preview
         preview_y = self.KEY_START_Y - 10
         if self._typed_preview:
             preview = self._typed_preview[-10:]
             pad_x = 8
             tw = cv2.getTextSize(preview, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)[0][0]
             bx1 = min(self.frame_w - 4, pad_x + tw + 16)
-            cv2.rectangle(img, (pad_x, preview_y - 26), (bx1, preview_y + 4), (235, 235, 240), cv2.FILLED)
-            cv2.rectangle(img, (pad_x, preview_y - 26), (bx1, preview_y + 4), (255, 255, 255), 1)
-            cv2.putText(
-                img,
-                preview,
-                (pad_x + 8, preview_y - 4),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (20, 20, 20),
-                1,
-                cv2.LINE_AA,
-            )
+            cv2.rectangle(img, (pad_x, preview_y - 26), (bx1, preview_y + 4), 
+                        (235, 235, 240), cv2.FILLED, cv2.LINE_AA)
+            cv2.rectangle(img, (pad_x, preview_y - 26), (bx1, preview_y + 4), 
+                        (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(img, preview, (pad_x + 8, preview_y - 4), cv2.FONT_HERSHEY_SIMPLEX,
+                       0.55, (20, 20, 20), 1, cv2.LINE_AA)
+        
+        # Draw FPS indicator in performance mode
+        if self._performance_mode:
+            cv2.putText(img, f"KB FPS: {int(self._keyboard_fps)}", (10, self.frame_h - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 100, 100), 1)
+        
         return hovered
 
     def press_key(self, key: Optional[str], now: float) -> bool:
@@ -320,12 +569,22 @@ class SimpleKeyboard:
         self._press_key = key
         self._press_until = now + 0.12
 
+        # Haptic feedback
+        if self._enable_haptic and winsound:
+            try:
+                winsound.Beep(1000, 20)  # 1000Hz for 20ms
+            except:
+                pass  # Fail silently if sound doesn't work
+
         if key == "SPACE":
             pyautogui.press("space")
             self._typed_preview += " "
         elif key == "BACKSPACE":
             pyautogui.press("backspace")
-            self._typed_preview = self._typed_preview[:-1]
+            if self._typed_preview:
+                self._typed_preview = self._typed_preview[:-1]
+        elif key == "DELETE":
+            pyautogui.press("delete")
         elif key == "ENTER":
             pyautogui.press("enter")
             self._typed_preview += " "
@@ -657,9 +916,11 @@ while True:
             cv2.circle(img, (ix, iy), 8, (255, 0, 255), cv2.FILLED)
 
             pinch_down = thumb_index_dist < keyboardPinchThreshold and fingers[1] == 1
-            pinch_edge = pinch_down and not keyboard_pinch_prev
-            keyboard_pinch_prev = pinch_down
-            if pinch_edge and active_key:
+            
+            # Use stable pinch detection to prevent accidental clicks
+            should_click = simple_kb._should_trigger_pinch(pinch_down, now)
+            
+            if should_click and active_key:
                 simple_kb.press_key(active_key, now)
         else:
             # Drawing mode: mirror X so ink tracks the fingertip as shown (same intuition as cursor wScr flip).
