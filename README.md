@@ -353,4 +353,4 @@ Window stays **topmost** via `cv2.WND_PROP_TOPMOST`.
 
 ## License / safety note
 
-This software moves the **real** mouse cursor, **clicks**, **scrolls**, and can **type** into the focused application. It can change **system volume** and **screen brightness**. Only use it where that behavior is acceptable. Disable or close the app before leaving an unattended machine if others could trigger gestures on camera. 
+This software moves the **real** mouse cursor, **clicks**, **scrolls**, and can **type** into the focused application. It can change **system volume** and **screen brightness**. Only use it where that behavior is acceptable. Disable or close the app before leaving an unattended machine if others could trigger gestures on camera.

@@ -53,6 +53,14 @@ scrollAccumulator = 0.0
 keyboardPinchThreshold = 28
 keyboard_pinch_prev = False
 
+# Keyboard stability variables
+last_ix, last_iy = 0, 0  # Last known finger position
+smooth_ix, smooth_iy = 0, 0  # Smoothed finger position
+prev_ix, prev_iy = 0, 0  # Previous frame position for dead zone
+pinch_start_threshold = 28
+pinch_release_threshold = 40
+pinch_active = False
+
 # Drawing mode setup.
 canvas = np.zeros((hCam, wCam, 3), dtype=np.uint8)
 # penColor: last palette pick; drawing uses mirrored coords (drawX) to match on-screen hand.
@@ -193,7 +201,7 @@ class SimpleKeyboard:
         ]
         self.key_rects = []
         self.last_press_time = 0.0
-        self.press_cooldown = 0.08
+        self.press_cooldown = 0.12
         self._typed_preview = ""
         self._press_key = None
         self._press_until = 0.0
@@ -224,23 +232,30 @@ class SimpleKeyboard:
                     self.key_rects.append((k, x, y, self.KEY_W, self.KEY_H))
                     x += self.KEY_W + self.KEY_GAP
             else:
-                w_space = 5 * self.KEY_W + 4 * self.KEY_GAP
+                # Optimized spacebar layout - make spacebar much larger and positioned for natural reach
+                w_space = 8 * self.KEY_W + 7 * self.KEY_GAP  # Even larger spacebar
                 w_bs = 2 * self.KEY_W + self.KEY_GAP
                 w_ent = 2 * self.KEY_W + self.KEY_GAP
-                rw = w_space + w_bs + w_ent + 2 * self.KEY_GAP
-                x = (self.frame_w - rw) // 2
-                for k, kw in [("SPACE", w_space), ("BACKSPACE", w_bs), ("ENTER", w_ent)]:
-                    self.key_rects.append((k, x, y, kw, self.KEY_H))
-                    x += kw + self.KEY_GAP
+                # Position spacebar lower and more centered for natural finger movement
+                space_y = y + 5  # Move down slightly for better reach
+                space_x = (self.frame_w - w_space) // 2
+                self.key_rects.append(("SPACE", space_x, space_y, w_space, self.KEY_H))
+                # Position BACKSPACE and ENTER above to save space
+                bs_y = space_y - (self.KEY_H + self.KEY_GAP)
+                ent_y = space_y - (self.KEY_H + self.KEY_GAP)
+                bs_x = space_x
+                ent_x = space_x + w_space - w_ent
+                self.key_rects.append(("BACKSPACE", bs_x, bs_y, w_bs, self.KEY_H))
+                self.key_rects.append(("ENTER", ent_x, ent_y, w_ent, self.KEY_H))
             y += self.KEY_H + self.KEY_GAP
 
     def _label_for_draw(self, key: str) -> str:
         if key == "BACKSPACE":
-            return "\u232b"
+            return "BKSP"  # Simple text instead of Unicode
         if key == "ENTER":
-            return "\u21b5"
+            return "ENTER"  # Simple text instead of Unicode
         if key == "SPACE":
-            return "Space"
+            return "SPACE"  # Keep as is
         return key
 
     def key_at(self, x_pos: float, y_pos: float) -> Optional[str]:
@@ -494,6 +509,8 @@ while True:
 
     if mode != "keyboard":
         keyboard_pinch_prev = False
+        # Reset pinch state when leaving keyboard mode
+        pinch_active = False
 
     if len(lmList) != 0:
         ix, iy = lmList[8][1], lmList[8][2]  # Index tip
@@ -688,18 +705,82 @@ while True:
             cv2.circle(img, (ix, iy), 8, (255, 0, 255), cv2.FILLED)
             cv2.line(img, (tx, ty), (ix, iy), (255, 0, 255), 2)
         elif mode == "keyboard":
-            # Keyboard mode: no OS cursor motion — raw index tip (ix, iy) drives overlay only.
+            # Keyboard mode: enhanced stability with always-visible keyboard
             lastScrollY = None
             scrollAccumulator = 0.0
 
-            active_key = simple_kb.draw(img, ix, iy, now)
-            cv2.circle(img, (ix, iy), 8, (255, 0, 255), cv2.FILLED)
-
-            pinch_down = thumb_index_dist < keyboardPinchThreshold and fingers[1] == 1
-            pinch_edge = pinch_down and not keyboard_pinch_prev
-            keyboard_pinch_prev = pinch_down
-            if pinch_edge and active_key:
-                simple_kb.press_key(active_key, now)
+            # Update finger position tracking with optimized calculations
+            if len(lmList) != 0:
+                ix, iy = lmList[8][1], lmList[8][2]  # Index tip
+                
+                # Optimized dead zone filter - use squared distance to avoid sqrt
+                dx = ix - prev_ix
+                dy = iy - prev_iy
+                if dx*dx + dy*dy < 9:  # 3*3 = 9, squared distance
+                    ix, iy = prev_ix, prev_iy  # Use previous position
+                else:
+                    prev_ix, prev_iy = ix, iy  # Update previous position
+                
+                # Update last known position
+                last_ix, last_iy = ix, iy
+                
+                # Optimized smoothing with integer math for better performance
+                smooth_ix = (smooth_ix * 3 + ix) // 4  # Faster than division
+                smooth_iy = (smooth_iy * 3 + iy) // 4
+            else:
+                # Use last known position when hand disappears
+                ix, iy = last_ix, last_iy
+                smooth_ix, smooth_iy = last_ix, last_iy
+            
+            # Finger position tracking and pinch detection handled above
+            # Keyboard is rendered outside hand detection block for always-visible behavior
+            # Get active key from keyboard drawing for pinch detection
+            current_time = time.time()
+            active_key = simple_kb.key_at(smooth_ix, smooth_iy)
+            
+            # Draw finger indicator
+            if len(lmList) != 0:
+                cv2.circle(img, (ix, iy), 8, (255, 0, 255), cv2.FILLED)
+            
+            # Enhanced pinch detection with optimized calculations
+            if len(lmList) != 0:
+                # Calculate distance only when needed
+                dx = tx - ix
+                dy = ty - iy
+                dist_sq = dx*dx + dy*dy  # Squared distance to avoid sqrt
+                
+                # Use squared thresholds for comparison
+                start_thresh_sq = pinch_start_threshold * pinch_start_threshold
+                release_thresh_sq = pinch_release_threshold * pinch_release_threshold
+                
+                fingers = detector.fingersUp()
+                
+                # Optimized pinch hysteresis logic
+                if not pinch_active:
+                    # Start pinch only when below start threshold
+                    if dist_sq < start_thresh_sq and fingers[1] == 1:
+                        pinch_active = True
+                        pinch_down = True
+                    else:
+                        pinch_down = False
+                else:
+                    # Release only when above release threshold
+                    if dist_sq > release_thresh_sq or fingers[1] == 0:
+                        pinch_active = False
+                        pinch_down = False
+                    else:
+                        pinch_down = True
+                
+                # Trigger on pinch edge only
+                pinch_edge = pinch_down and not keyboard_pinch_prev
+                keyboard_pinch_prev = pinch_down
+                
+                if pinch_edge and active_key:
+                    simple_kb.press_key(active_key, current_time)
+            else:
+                # Reset pinch state when hand disappears
+                pinch_active = False
+                keyboard_pinch_prev = False
         else:
             # Drawing mode: mirror X so ink tracks the fingertip as shown (same intuition as cursor wScr flip).
             lastScrollY = None
@@ -796,6 +877,24 @@ while True:
         img = cv2.addWeighted(img, 0.7, canvas, 1.0, 0.0)
         _render_drawing_ui(img, drawBrushThicknessDisplay, time.time())
         _draw_drawing_fingertip_overlay(img)
+    
+    # ALWAYS render keyboard in keyboard mode (even without hand detection)
+    if mode == "keyboard":
+        current_time = time.time()
+        # Use smoothed position or last known position
+        if smooth_ix == 0 and smooth_iy == 0:
+            # Initialize with center position if no previous data
+            smooth_ix, smooth_iy = wCam // 2, hCam // 2
+        simple_kb.draw(img, smooth_ix, smooth_iy, current_time)
+        
+        # Draw optimized fingertip pointer for keyboard hovering
+        # Use simpler drawing for better performance
+        px, py = int(smooth_ix), int(smooth_iy)
+        cv2.circle(img, (px, py), 8, (0, 255, 0), 2)  # Smaller outer circle
+        cv2.circle(img, (px, py), 3, (0, 255, 0), cv2.FILLED)  # Smaller center
+        # Simple crosshair with fewer lines
+        cv2.line(img, (px - 10, py), (px + 10, py), (0, 255, 0), 1)
+        cv2.line(img, (px, py - 10), (px, py + 10), (0, 255, 0), 1)
 
     cTime = time.time()
     fps = 1/(cTime - pTime) if (cTime - pTime) != 0 else 0
