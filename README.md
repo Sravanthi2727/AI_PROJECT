@@ -8,21 +8,25 @@ A single Windows application (`cursor.py`) that uses your **webcam** and **Media
 
 1. [What it does](#what-it-does-feature-summary)  
 2. [Requirements](#requirements)  
-3. [Installation](#installation)  
-4. [How to run](#how-to-run)  
-5. [Finger notation](#finger-notation)  
-6. [Modes and switching](#modes-and-switching)  
-7. [Universal gestures](#universal-gestures-all-modes)  
-8. [Cursor mode](#cursor-mode)  
-9. [Volume mode](#volume-mode)  
-10. [Brightness mode](#brightness-mode)  
-11. [Keyboard mode](#keyboard-mode)  
-12. [Drawing mode](#drawing-mode)  
-13. [On-screen UI](#on-screen-ui)  
-14. [Technical details](#technical-details-implementation)  
-15. [Troubleshooting](#troubleshooting)  
-16. [Project files](#project-files)  
-17. [Safety](#license--safety-note)
+3. [Hardware Components](#hardware-components)  
+4. [Hardware Connections](#hardware-connections)  
+5. [ESP32 LED Display Integration](#esp32-led-display-integration)  
+6. [Installation](#installation)  
+7. [How to run](#how-to-run)  
+8. [Running with ESP32 Display](#running-with-esp32-display)  
+9. [Finger notation](#finger-notation)  
+10. [Modes and switching](#modes-and-switching)  
+11. [Universal gestures](#universal-gestures-all-modes)  
+12. [Cursor mode](#cursor-mode)  
+13. [Volume mode](#volume-mode)  
+14. [Brightness mode](#brightness-mode)  
+15. [Keyboard mode](#keyboard-mode)  
+16. [Drawing mode](#drawing-mode)  
+17. [On-screen UI](#on-screen-ui)  
+18. [Technical details](#technical-details-implementation)  
+19. [Troubleshooting](#troubleshooting)  
+20. [Project files](#project-files)  
+21. [Safety](#license--safety-note)
 
 ---
 
@@ -52,6 +56,62 @@ A single Windows application (`cursor.py`) that uses your **webcam** and **Media
 | **Model file** | **`hand_landmarker.task`** in the project directory (same folder as `handtrackingModule.py`). Download or copy from the [MediaPipe Hand Landmarker](https://developers.google.com/mediapipe/solutions/vision/hand_landmarker) assets if missing. |
 | **Lighting** | Good lighting improves landmark stability. |
 | **Hands** | One hand is tracked (`maxHands=1`). |
+
+---
+
+## Hardware Components
+
+| Component | Description |
+|----------|------------|
+| ESP32 Development Board | Microcontroller used to receive data and control LED display |
+| MAX7219 8x8 LED Matrix (x2) | Displays typed characters |
+| Jumper Wires | For connections |
+| USB Cable | For ESP32 power and communication |
+| Webcam | For hand gesture detection |
+
+---
+
+## Hardware Connections
+
+Connect MAX7219 to ESP32 as follows:
+
+| MAX7219 Pin | ESP32 Pin |
+|------------|----------|
+| VCC        | 5V       |
+| GND        | GND      |
+| DIN        | GPIO 23  |
+| CS         | GPIO 5   |
+| CLK        | GPIO 18  |
+
+**Additional Notes:**
+- Use 2 matrices connected in series (daisy-chain)
+- Connect OUT of first matrix to IN of second
+- Ensure proper power supply (5V recommended)
+
+---
+
+## ESP32 LED Display Integration
+
+This project extends the virtual keyboard by sending typed characters to an ESP32, which displays them on MAX7219 LED matrices in real-time.
+
+### Working Flow
+
+Hand Gesture → Python (cursor.py) → Serial Communication → ESP32 → LED Matrix Display
+
+### Key Behavior
+
+| Input | Action on Display |
+|------|------------------|
+| Character | Displayed instantly |
+| Backspace | Removes last character |
+| Enter | Clears display |
+
+### Communication Details
+
+- Communication via USB Serial
+- Baud rate: 115200
+- Python sends characters directly
+- ESP32 updates display instantly
 
 ---
 
@@ -106,6 +166,22 @@ The OpenCV window title is **`Virtual Mouse`**. It is created as **topmost** eac
 ### Exit via gesture
 
 Hold a **full fist** (all fingers counted as down: `[0,0,0,0,0]`) for **`exitHoldSeconds` = 0.8 s**. A countdown **“Exit in … s”** appears.
+
+---
+
+## Running with ESP32 Display
+
+1. Upload ESP32 code using Arduino IDE  
+2. Connect ESP32 to your computer  
+3. Close Arduino Serial Monitor  
+4. Run the Python application:
+   ```bash
+   python cursor.py
+   ```
+5. Switch to keyboard mode  
+6. Use pinch gesture to type  
+
+Typed characters will appear instantly on the LED matrix.
 
 ---
 
